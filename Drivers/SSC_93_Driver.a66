@@ -1,0 +1,360 @@
+; My driver to work with SPI EEPROM in ECUs
+; 512-byte EEPROM sampling line - P4.7
+; The driver is written rather carelessly, it is
+; a rewritten version of the driver from the MiniMon kit, in which
+; I added a group write function to EEPROM from RAM, using
+; script-and this will be done much faster than rather curves
+; operations of working with flash by means of the Minimon itself (by byte it works
+; extremely slowly).
+
+$SEGMENTED
+$MOD167
+$NoPaging
+           assume  DPP3:system
+
+; Driver function codes
+
+_ReadSPI   equ     36h     ; read block
+_WriteSPI  equ     37h     ; block record
+_GetState  equ     06h     ; read state
+
+; SPI EEPROM Commands; start 1 bit included
+
+_EEWrite			equ     05h     ; Write
+_EERead				equ     06h     ; Read
+_EEWREN				equ     04h     ; Enable Write
+	
+;	Type of 93 eeprom
+
+_TYPE_6BYTE_ADDR	equ		0x02;
+_TYPE_8BYTE_ADDR	equ		0x03;
+_TYPE_10BYTE_ADDR	equ		0x04;
+	
+_SSC_CONFIG_OFF		equ		0x0037;
+_SSC_CONFIG_8BIT	equ		0xC037;
+_SSC_CONFIG_10BIT	equ		0xC039;
+_SSC_CONFIG_12BIT	equ		0xC03B;
+_SSC_CONFIG_14BIT	equ		0xC03D;
+_SSC_CONFIG_16BIT	equ		0xC03F;
+_SSC_CONFIG_16BIT_RECEIVE	equ		0xC01F;		clock phase 0 -> sample on falling after leading rising edge
+
+; MCU registers
+
+P3         defr    0FFC4h          ; port P3
+DP3        defr    0FFC6h          ; its direction lines
+P4         defr    0FFC8h          ; port P4
+DP4        defr    0FFCAh          ; its direction lines
+P6         defr    0FFCCh          ; port P6
+DP6        defr    0FFCEh          ; its direction lines
+SSCRIC     defr    0FF74h			; SSC receive interrupt control reg
+SSCCON     defr    0FFB2h          ; SSC configuration register
+SSCTB      defr    0F0B0h          ; SSC transmit register
+SSCRB      defr    0F0B2h          ; SSC receive register
+SSCBR      defr    0F0B4h          ; SSC baudrate
+SSCRIR     equ     SSCRIC.7        ; exchange completion flag
+;SPI_CS     equ     P4.7            ; CS line
+;SPI_CS_PD  equ     DP4.7           ; port direction control
+SPI_CS		equ     P6.3            ; CS line
+SPI_CS_PD	equ     DP6.3           ; port direction control
+	
+SPI_MRST	equ     P3.8            ; Master Receive/ Slave Transmitt line
+SPI_SCLK	equ     P3.13            ; SCLK line
+
+CallCS		section code at 0F600h	;; Chip select call funcs
+
+SetCsDirection	proc	near
+			bset	SPI_CS_PD       ;switch the line to output
+			ret
+SetCsDirection	endp
+	
+ClearCsDirection	proc	near
+			bclr	SPI_CS_PD       ; and switch the line back to input  
+			ret
+ClearCsDirection	endp
+	
+ClearCs	proc	near
+			bclr	SPI_CS          ; -CS=1
+			ret
+ClearCs	endp	
+
+SetCs	proc	near
+			bset	SPI_CS          ; -CS
+			ret
+SetCs	endp
+	
+CallCS		ends
+
+DriverC		section code at 0F640h
+
+; ------------------------------------------------- ---------------------
+; Reading SPI EEPROM to buffer
+; r8 - operation code;
+; r9 is the length of the read block;
+; r10 - address in EEPROM;
+; R11 - Type of eeprom : 2 -> 6 bit addres ; 3-> 8bit 93c56&66; 4-> 93c76 & 86 10bit address for X16 config
+; r13 - buffer address;
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+DriverP		proc	far
+; save r0-7
+;			push	r0
+;			push	r1
+;			push	r2
+			push	r3
+			push	r4
+;			push	r5
+;			push	r6
+;			push	r7
+
+; Deselect EEPROM
+			callr	ClearCs          ; -CS=1
+			nop
+			callr	SetCsDirection       ; and switch the line to output
+
+; SPI init
+
+           extr		#1
+           mov		SSCBR,#000Bh    ; baudrate speed in the ECU firmware
+;           mov     SSCCON,#0C037h  ; configuration
+           bfldh	P3,#023h,#23h   ; Set MRST=1, MTSR=1, SCLK=1
+           bfldh	DP3,#023h,#22h  ; Set MRST=input, MTSR=output, SCLK=output
+		   bclr		SPI_SCLK		; set sclk low on spi off
+           callr	Delay
+
+; ------------------------------------------------- ---------------------
+; Writing a block from RAM to EEPROM
+; r8 - operation code;
+; r9 - block length in bytes (for programming - 1, byte!);
+; r10 - EEPROM address
+; R11 - Type of eeprom : 2 -> 6 bit addres ; 3-> 8bit 93c56&66; 4-> 93c76 & 86 10bit address for X16 config
+; r13 - RAM address
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+Cmd1:
+           cmp     r8,#_WriteSPI   ; block recording?
+           jmp     cc_ne,Cmd2      ; no
+		   
+		   	callr	SetCs          ; EEPROM selection
+			mov     R3,#_EEWREN     ; recording enable
+			push	R10				; save addr for further use
+			mov		R10, #0x600		; command write en needs 1 at A8&A9
+			callr	SendCommandAndAddress	; send command in r3 and address in r10 depending on type in r11
+			callr	ClearCs          ; switch off EEPROM selection
+			pop		R10				; restore address 
+			callr   Delay
+			
+Block:
+			callr	SetCs          ; EEPROM selection
+
+			mov		r3,#_EEWrite
+			callr	SendCommandAndAddress	; send command in r3 and address in r10 depending on type in r11
+			
+			mov     SSCCON,#_SSC_CONFIG_16BIT  ; configure to 16 bit _SSC_CONFIG_16BIT_RECEIVE
+			call	Delay
+			bset	SPI_SCLK		; set sclk high on spi on
+
+			exts    #0,#1
+			mov		R3,[R13]       	; Word of data from RAM
+			callr   SendRecSSC      ;
+			
+			callr	ClearCs          ; switch off EEPROM selection
+			callr   Delay
+			
+			mov		r14, #0x2000		; timout counter
+			callr	SetCs          ; EEPROM selection
+
+WaitWritestart:
+			cmpd1	r14,#1
+			jmpr    cc_z,TimeoutWriteBusy		; timeout occurred
+			jb		SPI_MRST,WaitWritestart  ; waiting for completion
+			
+WaitWrite:
+			cmpd1	r14,#1
+			jmpr    cc_z,TimeoutWriteBusy		; timeout occurred
+			jnb		SPI_MRST,WaitWrite  ; waiting for completion
+			
+			
+			callr	ClearCs          ; switch off EEPROM selection
+
+			add     r13,#2          ; next byte in RAM
+			add     r10,#2          ; next EEPROM address
+			sub     r9,#2
+			jmp     cc_nz,Block
+			mov     r15,#0          ; completion code
+;exit
+			jmp     cc_uc,RestoreRegs      ; no
+			
+TimeoutWriteBusy:
+			mov     r15,#99          ; timeout code
+			jmp     cc_uc,RestoreRegs      ; no
+
+; ------------------------------------------------- ---------------------
+; Reading SPI EEPROM to buffer
+; r8 - operation code;
+; r9 is the length of the read block;
+; r10 - address in EEPROM;
+; R11 - Type of eeprom : 2 -> 6 bit addres ; 3-> 8bit 93c56&66; 4-> 93c76 & 86 10bit address for X16 config
+; r13 - buffer address;
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+Cmd2:		cmp     r8,#_ReadSPI    ; reading a block?
+			jmp     cc_ne,Cmd3      ; no
+
+			callr	SetCs          ; -CS
+           
+			mov		r3,#_EERead
+			callr	SendCommandAndAddress	; send command in r3 and address in r10 depending on type in r11
+			
+			mov     SSCCON,#_SSC_CONFIG_16BIT_RECEIVE  ; configure to 16 bit _SSC_CONFIG_16BIT_RECEIVE
+			call	Delay
+			bset	SPI_SCLK		; set sclk high on spi on
+			
+;			mov		r5,r13			; Buffer address
+			sub		r9,#2
+			
+ReadLoop:
+			callr   SendRecSSC      ; read byte
+			exts    #0,#1
+			mov		[R13],R4        ; store byte in buffer
+			add     R13,#2           ; next address
+			cmpd2   r9,#0
+			jmpr    cc_ugt,ReadLoop ; until r9 > 0
+
+			callr	ClearCs          ; switch off EEPROM selection
+			mov     r15,#0          ; completion code
+;exit
+			jmp     cc_uc,RestoreRegs      ; no
+
+; ------------------------------------------------- ---------------------
+; Reading EEPROM status, r9 returns status value
+; ------------------------------------------------- ---------------------
+
+Cmd3:
+;      cmp     r8,#_GetState
+;           jmp     cc_ne,CmdC
+;
+;Read_S:
+;			callr	ClearCs          ; -CS
+;			mov		R3,#_EEState
+;			callr	SendRecSSC      ; status register read command
+;           
+;			callr	SendRecSSC      ; send dummy byte, receive data byte
+;			mov		r9,r4           ; in r9
+;
+;			callr	SetCs          ; switch off EEPROM selection
+;			mov		r15,#0          ; completion code
+;exit
+;			jmp		cc_uc,RestoreRegs      ; no
+
+; ------------------------------------------------- ---------------------
+; Unrecognized command, exit c r15 = 1
+; ------------------------------------------------- ---------------------
+CmdC:      mov     r15,#1
+
+
+RestoreRegs:
+			call	ClearCsDirection
+; save r0-7
+;			pop		r7
+;			pop		r6
+;			pop		r5
+			pop		r4
+			pop		r3
+;			pop		r2
+;			pop		r1
+;			pop		r0
+			rets
+			
+DriverP    endp
+
+;----------------------------------------------------------------------
+; Small delay ...
+;----------------------------------------------------------------------
+
+Delay      proc    near
+           nop
+           nop
+           nop
+           nop
+           ret
+Delay      endp
+
+; ------------------------------------------------- ---------------------
+; SSC work program - data reception and transmission
+; r3 - transmitted value; r4 - received value
+; ------------------------------------------------- ---------------------
+
+SendRecSSC	proc	near
+
+			bclr	SSCRIR          ; reset flag
+			mov		SSCTB,r3        ; transmission start
+			mov		r14, #0x40
+SSCWait:
+			cmpd1	r14,#1
+			jmpr    cc_z,TimeoutSRSSC		; timeout occurred
+			jnb		SSCRIR,SSCWait  ; waiting for completion
+TimeoutSRSSC:
+			mov		R4,SSCRB        ; received data
+			ret
+
+SendRecSSC	endp
+	
+SendCommandAndAddress	proc	near	;command in r3 (address if needed is added), r10.. address, r11.. is type
+			
+			bclr	SPI_SCLK		; set sclk low on spi off
+			mov     SSCCON,#_SSC_CONFIG_OFF  ; turn off ssc module
+			
+			mov		R4, R10		;;address from R10 into R4
+			ror		R4, #1		; 16Bit config (Org pin high)
+			cmp		r11,#_TYPE_6BYTE_ADDR
+			jmp     cc_eq, Addr6Bit
+			
+			cmp		r11,#_TYPE_8BYTE_ADDR
+			jmp     cc_eq, Addr8Bit
+			
+Addr10Bit:			
+			; 8Bit address after startBit and 2bit opcode
+			
+			mov     SSCCON,#_SSC_CONFIG_14BIT  ; configure to 11 bit
+			and		R4,#0x03FF
+			rol		R3, #10
+			or		R3, R4
+
+			jmp     cc_uc,SendAddress
+			
+Addr8Bit:			
+			; 8Bit address after startBit and 2bit opcode
+			
+			mov     SSCCON,#_SSC_CONFIG_12BIT  ; configure to 11 bit
+			and		R4,#0x00FF
+			rol		R3, #8
+			or		R3, R4
+
+			jmp     cc_uc,SendAddress
+
+Addr6Bit:
+			; 6Bit address after startBit and 2bit opcode
+
+			mov     SSCCON,#_SSC_CONFIG_10BIT  ; configure to 9 bit
+			and		R4,#0x003F
+			rol		R3, #6
+			or		R3, R4
+
+SendAddress:
+
+			bset	SPI_SCLK		; set sclk high on spi on
+			callr   SendRecSSC      ; send  command & address
+			bclr	SPI_SCLK		; set sclk low on spi off
+			mov     SSCCON,#_SSC_CONFIG_OFF  ; turn off ssc module
+			call	Delay
+			ret
+			
+SendCommandAndAddress	endp
+;----------------------------------------------------------------------
+
+DriverC    ends
+
+           end

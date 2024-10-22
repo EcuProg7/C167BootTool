@@ -1,0 +1,517 @@
+; My driver to work with SPI EEPROM in ECUs
+; 512-byte EEPROM sampling line - P4.7
+; The driver is written rather carelessly, it is
+; a rewritten version of the driver from the MiniMon kit, in which
+; I added a group write function to EEPROM from RAM, using
+; script-and this will be done much faster than rather curves
+; operations of working with flash by means of the Minimon itself (by byte it works
+; extremely slowly).
+
+$SEGMENTED
+$MOD167
+$NoPaging
+           assume  DPP3:system
+
+;Timing defs
+HALFBITCYCLES	equ		0x20
+WRITE_TIME		equ		0x8000	;*5?? cycles
+
+; Driver function codes
+
+_Read		equ     36h     ; read block
+_Write		equ     37h     ; block record
+_GetState	equ     06h     ; read state
+
+;  EEPROM Commands
+
+_EEWrite			equ     02h     ; Write
+_EERead				equ     03h     ; Read
+_EEState			equ     05h     ; Read Status Register
+_EEWREN				equ     06h     ; Enable Write
+_EEREAD_ID_PAGE		equ		83h		; Read identification page
+
+; MCU registers
+
+P2         defr    0FFC0h          ; 0xE0 port P2
+DP2        defr    0FFC2h          ; 0xE1 its direction lines	1.. output, 0.. input
+ODP2       defr    0F1C2h          ; 0xE1 P2 open drain control reg; 0.. push/pull, 1.. open drain
+P3         defr    0FFC4h          ; port P3
+DP3        defr    0FFC6h          ; its direction lines
+P4         defr    0FFC8h          ; port P4
+DP4        defr    0FFCAh          ; its direction lines
+P6         defr    0FFCCh          ; port P6
+DP6        defr    0FFCEh          ; its direction lines
+SSCRIC     defr    0FF74h			; SSC receive interrupt control reg
+SSCCON     defr    0FFB2h          ; SSC configuration register
+SSCTB      defr    0F0B0h          ; SSC transmit register
+SSCRB      defr    0F0B2h          ; SSC receive register
+SSCBR      defr    0F0B4h          ; SSC baudrate
+SSCRIR     equ     SSCRIC.7        ; exchange completion flag
+
+
+SDAPin		equ     P2.8            ; SDA line
+SDA_DP		equ     DP2.8           ; port direction control
+SDA_ODP		equ     ODP2.8           ; open drain control
+SCLPin		equ     P2.9            ; SCL line
+SCL_DP		equ     DP2.9           ; port direction control
+SCL_ODP		equ     ODP2.9           ; open drain control
+
+CallCS				section code at 0F600h	;; Chip select call funcs
+
+
+
+
+	
+
+
+GetSDA				proc	near	;returns r6 = 0 if SDA is LOW, R6 = 1 if SDA is high
+;			jnb		SDAPin,PinIsZero  ; waiting for completion
+;			MOV		R6, #1
+;			ret
+;PinIsZero:
+;			MOV		R6, #0
+			MOV		R6,P2
+			AND		R6,#0x0100
+			shr		R6,#8
+			ret
+GetSDA				endp
+	
+SetSCLDirection		proc	near
+			bset	SCL_DP       ;switch the line to output
+;			extr    #1
+;			bset	SCL_ODP       ;switch the line to open drain
+			ret
+SetSCLDirection		endp
+	
+ClearSCLDirection	proc	near
+			bclr	SCL_DP       ; and switch the line back to input  
+			ret
+ClearSCLDirection	endp
+	
+ClearSCL			proc	near
+			bclr	SCLPin          ; -CS=1
+			ret
+ClearSCL			endp	
+
+SetSCL				proc	near
+			bset	SCLPin          ; -CS
+			ret
+SetSCL				endp
+
+
+GetDEVSEL			proc	near	;returns devsel with deviceCode and ChipEnable in r3 (1 0 1 0 E2 E1 A8 R/~W )
+			MOV		R3, #0xAC
+			ret
+GetDEVSEL			endp	
+	
+	
+CallCS				ends
+DriverC		section code at 0F640h
+
+; ------------------------------------------------- ---------------------
+; The beginning of the driver itself - initializing ports
+; r8 - operation code;
+; r9 - block length in bytes;
+; r10 - low bytes of the RAM address;
+; r13 - low bytes of the EEPROM address;
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+DriverP		proc	far
+; save r0-7
+			push	r0
+			push	r1
+			push	r2
+			push	r3
+			push	r4
+			push	r5
+			push	r6
+			push	r7
+
+
+			bset	SDAPin
+			bset	SCLPin
+			mov		DP2,#0x0300
+			extr    #1
+			mov		ODP2,#0x0300
+
+; ------------------------------------------------- ---------------------
+; Writing a block from RAM to EEPROM
+; r8 - operation code;
+; r9 - block length in bytes (for programming - 1, byte!);
+; r10 - EEPROM address
+; R11 - Type of eeprom : 0 -> 16 bit addres (95080, 95160, 95320); 1-> 8bit Address + A8,A9 & A10 in Instruction(A8 95040, A8&A9 only for 95P08)
+; r13 - RAM address
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+Cmd1:		cmp     r8,#_Write		; Writing a block?
+			jmp     cc_ne,Cmd2      ; no
+WriteLoop:	
+			mov		R6, #WRITE_TIME
+WaitWriteTime:
+			MOV		R7, #WRITE_TIME
+			call	Delay				; wait bitcycle time
+;			cmpd1	R6,#0
+;			jmp		cc_ugt, WaitWriteTime
+			
+			call	SendStart
+			
+			Call	GetDevselWithAddr
+			call	Send			; send devsel with rw, returns ackn true if R3 == 0
+			mov		R15,#16			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,ErrorExit		; end with error (return r15 = 1)
+
+			mov     r3,r10          ; LSB of byte address
+			call	Send
+			mov		R15,#17			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,ErrorExit		; end with error (return r15 = 1)
+
+			
+			
+			exts    #0,#1
+			movb    RL3,[r13]       ; byte of data from RAM
+			
+			call	Send
+			mov		R15,#18			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,ErrorExit		; end with error (return r15 = 1)
+			
+;			call	SendBit
+;			call	SendBit
+;			call	SendStop
+;			call	SendStart
+;			call	SendBit
+			call	SendStop
+			
+			add     r13,#1          ; next byte in RAM
+			add     r10,#1          ; next EEPROM address
+			sub     r9,#1
+			jmp     cc_nz,WriteLoop
+			
+			
+			mov     r15,#0          ; completion code
+;exit
+			jmp     cc_uc,RestoreRegs      ; no error
+
+ErrorExit:
+			call	SendStop
+			jmp     cc_uc,RestoreRegs      ; error in R15
+; ------------------------------------------------- ---------------------
+; Reading SPI EEPROM to buffer
+; r8 - operation code;
+; r9 is the length of the read block;
+; r10 - address in EEPROM;
+; R11 - Type of eeprom : 10-> 8bit Address  ; 11 -> 8bit Address + A8 in DEVSEL BIT 1
+; r13 - buffer address;
+; r15 - return code on exit
+; ------------------------------------------------- ---------------------
+
+Cmd2:		cmp     r8,#_Read		; reading a block?
+			jmp     cc_ne,CmdC      ; no
+
+
+			sub		r9,#1			;decrement length by one
+			
+			call	SendStart
+			
+			Call	GetDevselWithAddr
+			mov		R4, R3			; save for later usage
+
+
+
+			call	Send			; send devsel with rw, returns ackn true if R3 == 0
+			mov		R15,#2			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,RestoreRegs		; end with error (return r15 = 1)
+
+			mov     r3,r10          ; LSB of byte address
+			call	Send
+			mov		R15,#3			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,RestoreRegs		; end with error (return r15 = 1)
+			call	SendStart
+			mov		R3, R4			;send devsel with read
+			or		R3, #0x01		; set read
+			call	Send
+			mov		R15,#4			; error code if ackn fails
+			cmp		R3,#0
+			jmp		cc_nz,RestoreRegs		; end with error (return r15 = 1)
+			
+			jmp		cc_uc,ReadLoop
+SendRecAckn:
+			mov		R3,#0			
+			call	SendAckn
+ReadLoop:			
+			call	Receive
+			
+			exts    #0,#1
+			movb    [r13],RL4        ; store byte in buffer
+			add     r13,#1           ; next address
+			cmpd1   r9,#0
+			jmp    cc_ugt,SendRecAckn ; until r9 > 0
+			
+			
+			mov		R3,#1			; send not ackn
+			call	SendAckn
+			call	SendBit
+			
+			call	SendStop
+
+			mov     R15,#0          ; completion code
+;exit
+			jmp     cc_uc,RestoreRegs      ; no
+
+
+
+; ------------------------------------------------- ---------------------
+; Unrecognized command, exit c r15 = 1
+; ------------------------------------------------- ---------------------
+CmdC:      mov     r15,#99
+
+
+RestoreRegs:
+;			call	ClearCsDirection
+; save r0-7
+			pop		r7
+			pop		r6
+			pop		r5
+			pop		r4
+			pop		r3
+			pop		r2
+			pop		r1
+			pop		r0
+			rets
+			
+DriverP    endp
+
+;_____________________________----------_
+; return devsel with addr in R3
+GetDevselWithAddr	proc near
+			call	GetDEVSEL		; devsel in R3
+
+			and		R3, #0xFE		; set write addr
+			cmp		r11,#10
+			jmp		cc_eq,NoAddrInInstr
+			; A8  in instruction
+			mov		r4, r10
+			ror		r4,#7
+			and		r4,#0x0002
+			or		r3, r4
+NoAddrInInstr:
+			ret
+GetDevselWithAddr endp
+
+;----------------------------------------------------------------------
+; Small delay ...	gets cycles in r7
+;----------------------------------------------------------------------
+
+Delay			proc    near
+DelayLoop:	
+			cmpd1   r7,#0
+			jmp		cc_ugt,DelayLoop ; until r7 == 0
+			ret
+Delay			endp
+	
+	
+;----------------------------------------------------------------------
+; Send start
+;----------------------------------------------------------------------
+
+SendStart		proc    near
+;			call	SetSDADirection
+			bset	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			
+			bset	SDA_DP
+			bset	SDAPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			
+
+			bclr	SDAPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+;			call	ClearSCL
+			bclr	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			ret
+SendStart		endp
+	
+;----------------------------------------------------------------------
+; Send stop
+;----------------------------------------------------------------------
+
+SendStop		proc    near
+			bset	SDA_DP
+			bclr	SDAPin
+;			call	SetSCL
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			bset	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+;			call	SetSDA
+			bset	SDAPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			ret
+SendStop		endp
+
+;----------------------------------------------------------------------
+; Send bit ...	gets zero or none zero in r6 to send
+;----------------------------------------------------------------------
+
+SendBit			proc    near
+;			call	ClearSCL
+			bclr	SCLPin				; is already cleared at first
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+
+			cmp		r6,#0
+			jmp		cc_z,ZeroBit ; 
+;			call	SetSDA
+			bset	SDAPin
+			jmp		cc_uc,WaitBitcycle
+ZeroBit:
+;			call	ClearSDA
+			bclr	SDAPin
+WaitBitcycle:
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+;			call	SetSCL
+			bset	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+;			call	ClearSCL
+			bclr	SCLPin
+			
+
+			ret
+SendBit			endp
+
+; ------------------------------------------------- ---------------------
+; I2c work program - data  transmission
+; r3 - transmitted value;
+; ------------------------------------------------- ---------------------
+
+Send			proc	near
+
+			
+			mov		R0, #0x80			; bit shift mask var
+			bset	SDA_DP
+BitSendLoop:
+			mov		R6, R3
+			AND		R6, R0
+			call	SendBit
+			shr		R0,#1
+			cmp		R0,#0
+			jmp    cc_nz,BitSendLoop
+			
+			
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			
+;			call	ClearSDADirection
+			bclr	SDA_DP				; receive ackn
+			bset	SDAPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			
+			bset	SCLPin
+			
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+			mov		R3,P2
+			and		R3,#0x0100
+			bclr	SCLPin
+			ret
+
+Send			endp
+	
+; ------------------------------------------------- ---------------------
+; I2c work program - data  reception
+; r4 - transmitted value; 
+; ------------------------------------------------- ---------------------
+
+Receive			proc	near
+
+;			call	ClearSDADirection
+			bclr	SDA_DP
+			bset	SDAPin
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+			mov		R0, #0x80			; bit shift mask var
+			mov		R4,#0
+
+BitRecLoop:
+			shl		R4,#1
+;			call	ClearSCL
+			bclr	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+;			call	SetSCL
+			bset	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+;			call	GetSDA				;bit in R6	
+			mov		R6,P2
+			and		R6,#0x0100
+			shr		R6,#8
+			or		R4, R6
+			
+
+			
+			shr		R0,#1
+			cmp		R0,#0
+			
+
+			jmp		cc_nz,BitRecLoop
+			
+			bclr	SCLPin
+			
+			ret
+
+Receive			endp
+	
+
+;----------------------------------------------------------------------
+
+
+SendAckn			proc	near		;;in r3 0 if ackn !=0 if not
+			bclr	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			bset	SDA_DP				;set SDA output
+			cmp		R3,#0
+			jmp		cc_nz,NOT_ACKN
+			bclr	SDAPin
+			jmp		cc_uc,SEND_JUMP
+NOT_ACKN:
+			bset	SDAPin
+SEND_JUMP:			
+			MOV		R7, #HALFBITCYCLES
+			call	Delay				; wait bitcycle time
+			bset	SCLPin
+			MOV		R7, #HALFBITCYCLES
+			shl		R7,#1
+			call	Delay				; wait bitcycle time
+			bclr	SCLPin
+			ret
+SendAckn			endp
+	
+	
+
+	
+DriverC    ends
+
+           end

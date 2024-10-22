@@ -1,0 +1,348 @@
+;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;	Flash Routines for AMD Flash Am29F400B / Am29F800B
+;	SW Platform: MiniMon
+;	Author: Peter Kliegelhoefer
+;	Date: 12.11.1999
+;	Version: 1.0
+;	(C) 1999 Infineon AG
+;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+$SEGMENTED					; Segemented memory mode
+$CASE						; Symbols case sensitive
+$NoPaging
+ASSUME	DPP3:system
+
+$include(A29Fx00bx.equ)
+
+NAME	MINIMON
+
+StackData0	SECTION DATA SYSSTACK		; Data Section to reserve 
+						; Stack-Memory  
+	DSB	20H				; 32 Byte 
+
+StackData0	ENDS				; End of Dummy-Section
+	
+;******************************************************************************
+; Subroutine "Unlock Sequence"
+;******************************************************************************
+PatchSection	SECTION CODE at 0F600h
+
+UnlockSequence PROC far
+	
+	
+	MOV		R3,#0555h		; write AAh to x555h <<1<<s
+	SHL		R3,#1
+	MOV		R5,#0AAh
+	EXTS	R2,#1
+	MOV		[R3],R5
+		
+	MOV		R3,#02AAh		; write 55h to x2AAh << 1
+	SHL		R3,#1
+	MOV		R5,#055h
+	EXTS	R2,#1
+	MOV		[R3],R5
+
+	RET
+
+UnlockSequence endp
+
+;******************************************************************************
+; Subroutine "Reset to Read"
+;******************************************************************************
+
+ResetToRead PROC far
+	MOV	R6,#0000h		; Reset to read
+	MOV	R7,#0F0h
+	EXTS	R2,#1
+	MOV	[R6],R7
+
+	RET
+ResetToRead endp
+
+PatchSection	ENDS
+
+DriverCode0	SECTION CODE at 0F640h
+DriverProc 	PROC FAR
+
+
+;******************************************************************************
+;* PROGRAM FLASH
+;* Parameters: 	R9 =source block length (unity: byte)
+;* 	       		R10=source block start address low
+;* 	       		R11=source block start address high
+;* 	       		R12=destination block start address high	read
+;* 	       		R13=destination block start address low
+;* 	       		R14=destination block start address high	write
+;* Return:     	R15=error code
+;******************************************************************************
+
+; save r0-7 --------------------Entry Point
+			push	r0
+			push	r1
+			push	r2
+			push	r3
+			push	r4
+			push	r5
+			push	r6
+			push	r7
+
+
+Cmd1:	
+	CMP		R8,#(FC_PROG)
+	JMP		cc_NE,Cmd2
+
+CPrLp:  
+	MOV		R2, R14
+	AND		R2, #0x00c0
+	CALL	ResetToRead		; Reset to Read
+	CALL	UnlockSequence	
+
+; 3rd cycle
+	
+	MOV		R3,#0555h	; command program: write A0h to x5555h
+	SHL		R3,#1
+	MOV		R5,#0A0h
+	EXTS	R2,#1
+	MOV		[R3],R5
+
+; 4th cycle
+
+	EXTS	R11,#1		; read data source 
+	MOV		R5,[R10]
+	MOV		R7,R5		; save source data for later verification
+
+	ADD		R10,#2		; increment source pointer
+	ADDC	R11,#0
+
+	EXTS	R14,#1		; write to destination
+	MOV		[R13],R5
+
+				; operation successfully finished ?
+CPSLp:			
+	EXTS	R12,#1		; Read DQ7-DQ0, Addr = VA	
+	MOV		R4,[R13]
+	MOV		R6,R4		; save value
+	AND		R5,#0080h	; mask out Data.7
+	AND		R4,#0080h	; mask out DQ7	
+	CMP		R5,R4		
+	JMP		CC_NE, CHECK_DQ5
+
+Pass:	
+	EXTS	R12,#1		; Program verify
+	MOV		R4,[R13]
+	CMP		R7,R4
+	JMP		CC_NE,PROGER
+
+	ADD		R13,#2		; increment destination pointer
+	ADDC	R14,#0
+
+	SUB		R9,#2		; decrement length counter (wordwise)
+	CMP		R9,#0
+	JMP		cc_NE,CPrLp
+
+	MOV		R15,#0		; return error message "programming successful"
+
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+CHECK_DQ5:
+
+	JNB		R6.5, CPSLp
+
+	EXTS	R12,#1		; Read DQ7-DQ0, Addr = VA	
+	MOV		R4,[R13]
+	AND		R4,#0080h	; mask out DQ7	
+	CMP		R5,R4		
+	JMP		CC_EQ, Pass		
+
+PROGER:
+	CALL	ResetToRead		; Reset to Read
+
+	MOV		R14, R2		; return command write high byte
+	MOV		R15,#1		; return error message "programming not successful"
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+;******************************************************************************
+;* ERASE FLASH SECTOR
+;* Parameters: 	R9=A15-A0
+;*				R10=A23-A16		write
+;*				R11=A23-A16		read
+;*				R12=last sec. word addr (offset)
+;*				R14=sector number	#not used
+;* Return:		R15=error code
+;******************************************************************************
+
+
+Cmd2:	
+	CMP		R8,#(FC_ERASE)
+	JMP		cc_NE,Cmd3
+
+;	CALL	CSectS			; calculate sector start address
+					; Subroutine returns:   R1=A15-A0
+					; 			R2=A23-A16
+					;  R4=last sec. word addr (offset)
+	MOV		R1, R9
+	MOV		R2, R10
+	MOV		R4, R12
+
+	CALL	ResetToRead		; Reset to Read
+	CALL	UnlockSequence	
+
+; 3rd cycle
+	MOV		R3,#0555h		; command sector erase: write 80h to x555h
+	SHL		R3,#1
+	MOV		R5,#080h
+	EXTS	R2,#1
+	MOV		[R3],R5
+
+	CALL	UnlockSequence	
+
+; 6th cycle: sector erase
+
+	MOV		R5,#030h		; command sector erase: write 30h to SAx
+	EXTS	R2,#1
+	MOV		[R1],R5
+
+; 6th cycle:total chip erase
+
+;	MOV	R3,#05555h
+;	SHL	R3,#1
+;	MOV	R5,#10h
+;	EXTS	R2,#1
+;	MOVB	[R3],RL5
+	
+	MOV		R15,#0		; timeout counter
+	MOV		R14,#0		; timeout counter high word
+CESLp:					; erase operation finished ?
+	ADD		R15,#1
+	ADDC	R14,#0		;add only carry
+	CMP		R14,#(ERASE_TIMEOUTCYCLES)
+	JMP		cc_NE,NO_ERASE_TIMEOUT
+	MOV		R15,#(E_ERASE_FAILED)			; Erase not successful
+	jmp		cc_uc,RestoreRegsAndExit      ; no	
+
+NO_ERASE_TIMEOUT:
+	EXTS	R11,#1
+ 	MOV		R5,[R1]				
+	JNB		R5.7, CESLp		; DQ7=0 ? Poll again !
+
+
+					; sector blank check
+CERLp:
+	EXTS	R11,#1			
+	MOV	R5,[R4]			; check sector from top to bottom
+	CMP	R5,#0FFFFh
+	JMP	CC_NE,ERAERR
+	CMP	R4,R1
+	JMP	CC_EQ,ErSu
+	SUB	R4,#2			; decrement flash pointer
+	JMP	CERLp
+
+ErSu:
+	MOV	R15,#0			; Erase successful
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+ERAERR:
+	CALL	ResetToRead			; Reset to Read
+
+	MOV	R15,#1			; Erase not successful
+	jmp		cc_uc,RestoreRegsAndExit      ; no	
+
+
+
+
+;******************************************************************************
+;* Flash Blankcheck (4Mbit)
+;* Return:     	R10=A23-A16
+;*		R11=A15-A0
+;*		R15=error code       
+;******************************************************************************
+
+Cmd3:	CMP	R8,#(FC_BLANKCHECK)
+	JMP	cc_NE,Cmd4
+
+	MOV	R10,#8			; segment start address
+	MOV	R11,#0000h		; offset start address
+ChkFl:	EXTS	R10,#1
+	MOV	R5,[R11]
+	CMP	R5,#0FFFFh
+	JMP	CC_NE, NOTERA
+	ADD	R11,#2			; increment flash pointer (offset)	
+	CMP	R11,#0000h
+	JMP	CC_NE,ChkFl
+	CMPI1	R10,#000Fh		; increment flash pointer (segment)
+	JMP	CC_NE,ChkFl
+	
+	MOV	R15,#0			; Flash completely erased
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+NOTERA:
+	MOV	R15,#1			; Flash not completely erased	
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+
+;******************************************************************************
+;* Autoselect (Manuf ID, Device ID, TOP/ Bottom Boot Block) 
+;* Parameters: 
+;*				R10=A23-A16		write
+;*				R11=A23-A16		read
+;*				R14=Address (X00, X01)
+;* Status:     Address X00=Manuf ID, Address X01=Device ID
+;* Return:     R9=Data
+;******************************************************************************
+
+
+Cmd4:	
+	CMP		R8,#(FC_GETSTATE)
+	JMP		cc_NE,Cmd5
+
+	mov		R2,R10
+	CALL	ResetToRead		; Reset to Read
+
+; Status Command: GET MANUF ID/ GET DEVICE ID
+	mov		R8,#1		; 1 state register
+; Status Command: GET MANUF ID/ GET DEVICE ID
+
+	CALL	UnlockSequence	
+	
+				; 3rd cycle
+	MOV		R3,#0555h	;0x0555 << 1
+	SHL		R3,#1
+	MOV		R5,#090h
+	EXTS	R2,#1
+	MOV		[R3],R5
+				; 4th cycle
+	SHL		R14,#1
+	EXTS	R11,#1		; Get data
+	MOV		R9,[R14]
+
+	CALL	ResetToRead		; Reset to Read
+
+	MOV		R15,#0
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+Cmd5:	
+	MOV		R15,#(E_UNKNOWN_FC)
+	jmp		cc_uc,RestoreRegsAndExit      ; no
+
+
+
+
+RestoreRegsAndExit:
+; save r0-7
+			pop		r7
+			pop		r6
+			pop		r5
+			pop		r4
+			pop		r3
+			pop		r2
+			pop		r1
+			pop		r0
+			rets
+
+
+DriverProc	ENDP
+	
+	
+DriverCode0	ENDS
+
+END
