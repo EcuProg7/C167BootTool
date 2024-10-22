@@ -3,6 +3,8 @@ C167 / ST10 Boostrap mode tool, R/W ext. Flash, read int Rom/Flash, R/W ext SPI/
 
 For educational purposes only!
 
+All drivers are packed into the onefile executable.
+
 Usage:
 
 BootMode Tool for me(d)7 , Simos 3.x & EDC15VM/P+ Variants inspired by ArgDub , 360trev and Gremlin
